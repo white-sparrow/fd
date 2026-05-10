@@ -1,0 +1,309 @@
+name: 📌 1-Download url (API-batched)
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'Space-separated list of URLs to download'
+        required: true
+        type: string
+      mode:
+        description: 'Download mode'
+        required: false
+        default: 'normal'
+        type: choice
+        options:
+          - normal
+          - zip
+      split_threshold_mb:
+        description: 'Split files larger than this MB (0 = never split)'
+        required: false
+        default: 30
+        type: number
+      blob_concurrency:
+        description: 'Max parallel blob uploads (1-20)'
+        required: false
+        default: 10
+        type: number
+
+jobs:
+  save-file:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Install aria2, zip and Node deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 zip
+          npm install @octokit/rest
+
+      - name: AVASAM Downloader
+        run: |
+          echo "🏷️  AVASAM - Your Download Solution"
+          echo "🌐 https://avasam.ir"
+          echo ""
+
+      - name: Download files into run folder
+        run: |
+          MODE="${{ github.event.inputs.mode }}"
+          URLS="${{ github.event.inputs.urls }}"
+          SPLIT_THRESHOLD_MB="${{ github.event.inputs.split_threshold_mb }}"
+          SPLIT_THRESHOLD_BYTES=$(( SPLIT_THRESHOLD_MB * 1024 * 1024 ))
+
+          RUN_DIR="downloads/run_$(date +%Y%m%d_%H%M%S)"
+          mkdir -p "$RUN_DIR"
+
+          echo "🏷️  AVASAM (https://avasam.ir) - Downloading with mode: $MODE"
+          echo "Split threshold: $SPLIT_THRESHOLD_MB MB"
+          echo "Run folder: $RUN_DIR"
+
+          mkdir -p tmp_downloads
+
+          for URL in $URLS; do
+            RAW_FILENAME=$(basename "$URL")
+            # Strip query string (? and everything after it) to get a safe filename
+            CLEAN_FILENAME=$(echo "$RAW_FILENAME" | sed 's/\?.*//')
+            echo "⬇️ Downloading $URL -> $CLEAN_FILENAME (raw: $RAW_FILENAME)"
+            aria2c \
+              --split=2 \
+              --max-connection-per-server=2 \
+              --min-split-size=90M \
+              --dir="tmp_downloads" \
+              --out="$CLEAN_FILENAME" \
+              "$URL"
+          done
+
+          split_if_large() {
+            local SOURCE="$1"
+            local DEST_DIR="$2"
+            local LIMIT="$3"
+            local SIZE
+            SIZE=$(stat -c%s "$SOURCE")
+            local BASENAME=$(basename "$SOURCE")
+
+            if [ "$LIMIT" -gt 0 ] && [ "$SIZE" -ge "$LIMIT" ]; then
+              echo "✂️ $BASENAME is $(( SIZE / 1024 / 1024 ))MB — splitting into ${SPLIT_THRESHOLD_MB}MB parts"
+              zip -0 -s "${SPLIT_THRESHOLD_MB}m" "$DEST_DIR/${BASENAME}.zip" -j "$SOURCE"
+              echo "✅ Parts created: $(ls $DEST_DIR/${BASENAME}.z* 2>/dev/null | wc -l)"
+            else
+              cp "$SOURCE" "$DEST_DIR/$BASENAME"
+            fi
+          }
+
+          if [ "$MODE" = "zip" ]; then
+            ZIPFILE="$RUN_DIR/archive_$(date +%Y%m%d_%H%M%S).zip"
+            echo "📦 Creating zip archive: $ZIPFILE"
+            zip -j "$ZIPFILE" tmp_downloads/*
+            split_if_large "$ZIPFILE" "$RUN_DIR" "$SPLIT_THRESHOLD_BYTES"
+            [ -f "$ZIPFILE" ] && [ -f "$ZIPFILE.z01" ] && rm "$ZIPFILE"
+            rm -rf tmp_downloads
+          else
+            for FILE in tmp_downloads/*; do
+              [ -f "$FILE" ] || continue
+              split_if_large "$FILE" "$RUN_DIR" "$SPLIT_THRESHOLD_BYTES"
+            done
+            rm -rf tmp_downloads
+          fi
+
+          find "$RUN_DIR" -type f > created_files.txt
+          # Save run folder path for the next step
+          echo "$RUN_DIR" > run_dir.txt
+
+      - name: Generate download URLs list
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          REPO_OWNER="${GITHUB_REPOSITORY%/*}"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          BRANCH="${GITHUB_REF_NAME}"
+          RUN_DIR=$(cat run_dir.txt)
+
+          URL_FILE="${RUN_DIR}/download_urls.txt"
+          echo "📝 Generating raw download URLs for all chunks in ${RUN_DIR}..."
+
+          # Clear / create the file
+          > "$URL_FILE"
+
+          # List all files in the run folder (exclude the URL file itself)
+          find "$RUN_DIR" -type f ! -name "download_urls.txt" | sort | while read -r FILE; do
+            # Path relative to repo root (already the full path like downloads/run_.../chunk.z01)
+            REL_PATH="$FILE"
+            # Build raw GitHub URL
+            echo "https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${BRANCH}/${REL_PATH}" >> "$URL_FILE"
+          done
+
+          echo "✅ URLs written to ${URL_FILE} ($(wc -l < "$URL_FILE") links)"
+          # Add URL file to the commit list
+          echo "$URL_FILE" >> created_files.txt
+
+      - name: Commit new files via GitHub API (parallel blobs, with retries)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          BLOB_CONCURRENCY: ${{ github.event.inputs.blob_concurrency }}
+        run: |
+          cat << 'EOF' > api_commit.js
+          const fs = require('fs');
+          const { Octokit } = require('@octokit/rest');
+
+          const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+          const branch = process.env.GITHUB_REF_NAME;
+          const token = process.env.GITHUB_TOKEN;
+          const concurrency = parseInt(process.env.BLOB_CONCURRENCY || '10', 10);
+          const octokit = new Octokit({ auth: token });
+
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+          // Retry wrapper with exponential backoff
+          async function retryWithBackoff(fn, retries = 5, label = '') {
+            for (let attempt = 1; attempt <= retries; attempt++) {
+              try {
+                return await fn();
+              } catch (err) {
+                if (attempt === retries) throw err;
+                const delay = Math.min(1000 * 2 ** attempt + Math.random() * 1000, 15000);
+                console.warn(`   ⚠️ ${label} attempt ${attempt}/${retries} failed (${err.status || '?'}). Retrying in ${Math.round(delay/1000)}s...`);
+                await sleep(delay);
+              }
+            }
+          }
+
+          // Parallel processing with concurrency limit
+          async function asyncPool(poolLimit, array, iteratorFn) {
+            const ret = [];
+            const executing = [];
+            for (const item of array) {
+              const p = Promise.resolve().then(() => iteratorFn(item, array));
+              ret.push(p);
+              if (poolLimit <= array.length) {
+                const e = p.then(() => executing.splice(executing.indexOf(e), 1));
+                executing.push(e);
+                if (executing.length >= poolLimit) {
+                  await Promise.race(executing);
+                }
+              }
+            }
+            return Promise.all(ret);
+          }
+
+          const fileListPath = process.argv[2] || 'created_files.txt';
+          if (!fs.existsSync(fileListPath)) {
+            console.log('No files to commit.');
+            process.exit(0);
+          }
+
+          let filePaths = fs.readFileSync(fileListPath, 'utf-8')
+            .split('\n')
+            .map(f => f.trim())
+            .filter(f => f.length > 0);
+
+          if (filePaths.length === 0) {
+            console.log('No files to commit.');
+            process.exit(0);
+          }
+
+          console.log(`📦 Total files to commit: ${filePaths.length}`);
+          console.log(`⚡ Blob concurrency: ${concurrency}`);
+
+          (async () => {
+            // Get latest commit & base tree
+            const { data: refData } = await octokit.git.getRef({
+              owner, repo, ref: `heads/${branch}`
+            });
+            const latestCommitSha = refData.object.sha;
+            console.log(`🔗 Latest commit: ${latestCommitSha}`);
+
+            const { data: commitData } = await octokit.git.getCommit({
+              owner, repo, commit_sha: latestCommitSha
+            });
+            let currentTreeSha = commitData.tree.sha;
+
+            // Create blobs in parallel with concurrency limit and retries
+            const fileData = [];
+            let done = 0;
+            console.log(`\n⬆️  Creating ${filePaths.length} blobs (parallelism: ${concurrency})...`);
+
+            await asyncPool(concurrency, filePaths, async (filePath) => {
+              const content = await fs.promises.readFile(filePath, 'base64');
+              const blobSha = await retryWithBackoff(async () => {
+                const { data: blob } = await octokit.git.createBlob({
+                  owner, repo,
+                  content,
+                  encoding: 'base64'
+                });
+                return blob.sha;
+              }, 5, `Blob ${filePath}`);
+
+              fileData.push({ path: filePath, sha: blobSha });
+              done++;
+              if (done % 10 === 0 || done === filePaths.length) {
+                const pct = ((done / filePaths.length) * 100).toFixed(0);
+                console.log(`   📄 Blob ${done}/${filePaths.length} (${pct}%)`);
+              }
+            });
+
+            console.log('✅ All blobs created successfully.');
+
+            // Build trees in batches of 100
+            const BATCH_SIZE = 100;
+            const totalBatches = Math.ceil(fileData.length / BATCH_SIZE);
+            console.log(`\n🌳 Building trees (batch size ${BATCH_SIZE}, ${totalBatches} batches)...`);
+
+            for (let i = 0; i < fileData.length; i += BATCH_SIZE) {
+              const batch = fileData.slice(i, i + BATCH_SIZE);
+              const batchIndex = Math.floor(i / BATCH_SIZE) + 1;
+              console.log(`   🔨 Batch ${batchIndex}/${totalBatches} – ${batch.length} files`);
+
+              const treeItems = batch.map(item => ({
+                path: item.path,
+                mode: '100644',
+                type: 'blob',
+                sha: item.sha
+              }));
+
+              const newTreeSha = await retryWithBackoff(async () => {
+                const { data: newTree } = await octokit.git.createTree({
+                  owner, repo,
+                  base_tree: currentTreeSha,
+                  tree: treeItems
+                });
+                return newTree.sha;
+              }, 5, `Tree batch ${batchIndex}`);
+
+              currentTreeSha = newTreeSha;
+              console.log(`      New tree SHA: ${currentTreeSha}`);
+            }
+
+            // Create commit & update ref
+            console.log(`\n📝 Creating commit with tree ${currentTreeSha}...`);
+            const newCommitSha = await retryWithBackoff(async () => {
+              const { data: newCommit } = await octokit.git.createCommit({
+                owner, repo,
+                message: `[AVASAM] Download batch -> downloads/run_...`,
+                tree: currentTreeSha,
+                parents: [latestCommitSha]
+              });
+              return newCommit.sha;
+            }, 5, 'Create commit');
+
+            console.log(`   Commit SHA: ${newCommitSha}`);
+
+            await retryWithBackoff(async () => {
+              await octokit.git.updateRef({
+                owner, repo,
+                ref: `heads/${branch}`,
+                sha: newCommitSha
+              });
+            }, 5, 'Update branch ref');
+
+            console.log(`\n✅ Successfully committed ${filePaths.length} files.`);
+          })().catch(err => {
+            console.error('❌ API commit failed:', err);
+            process.exit(1);
+          });
+          EOF
+
+          node api_commit.js created_files.txt
