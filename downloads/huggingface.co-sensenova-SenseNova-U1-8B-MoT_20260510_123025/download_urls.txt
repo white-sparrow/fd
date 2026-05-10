@@ -1,0 +1,6 @@
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/huggingface.co-sensenova-SenseNova-U1-8B-MoT_20260510_123025/sensenova-SenseNova-U1-8B-MoT.mhtml.zip
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/huggingface.co-sensenova-SenseNova-U1-8B-MoT_20260510_123025/sensenova-SenseNova-U1-8B-MoT-tree-main.mhtml
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/huggingface.co-sensenova-SenseNova-U1-8B-MoT_20260510_123025/sensenova-SenseNova-U1-8B-MoT-discussions.mhtml
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/huggingface.co-sensenova-SenseNova-U1-8B-MoT_20260510_123025/sensenova-SenseNova-U1-8B-MoT-colab.mhtml
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/huggingface.co-sensenova-SenseNova-U1-8B-MoT_20260510_123025/sensenova-SenseNova-U1-8B-MoT-kaggle.mhtml
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/huggingface.co-sensenova-SenseNova-U1-8B-MoT_20260510_123025/sensenova-SenseNova-U1-8B-MoT-SFT.mhtml.zip
