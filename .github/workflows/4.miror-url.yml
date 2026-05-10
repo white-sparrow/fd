@@ -1,0 +1,326 @@
+name: 🌐 4-Mirror Website (Offline Copy)
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Website URL to mirror (e.g. https://huggingface.co)'
+        required: true
+        type: string
+      depth:
+        description: 'Recursion depth (1-5, lower = faster)'
+        required: false
+        default: '2'
+        type: number
+      max_file_size_mb:
+        description: 'Skip files larger than this MB (set to 0 to keep all)'
+        required: false
+        default: '10'
+        type: number
+      reject_extensions:
+        description: 'Comma-separated extensions to skip (e.g. bin,safetensors,pt)'
+        required: false
+        default: 'bin,safetensors,pt,ckpt,h5,onnx,pth,pickle,zip,tar,tar.gz,tgz,gz,xz,7z,rar'
+        type: string
+      cross_host:
+        description: 'Allow downloading off‑site resources (CSS, JS)'
+        required: false
+        default: 'false'
+        type: boolean
+      wait_seconds:
+        description: 'Seconds between requests (be polite!)'
+        required: false
+        default: '1'
+        type: number
+      split_threshold_mb:
+        description: 'Split final archive if larger than this MB (0 = never split)'
+        required: false
+        default: '30'
+        type: number
+      blob_concurrency:
+        description: 'Max parallel blob uploads (1-20)'
+        required: false
+        default: '10'
+        type: number
+
+jobs:
+  mirror-website:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget zip
+          npm install @octokit/rest
+
+      - name: 🏷️ AVASAM - Mirror Builder
+        run: |
+          echo "🏷️  AVASAM - Your Download Solution"
+          echo "🌐 https://avasam.ir"
+          echo ""
+
+      - name: Mirror website and package
+        run: |
+          URL="${{ github.event.inputs.url }}"
+          DEPTH="${{ github.event.inputs.depth }}"
+          MAX_SIZE_MB="${{ github.event.inputs.max_file_size_mb }}"
+          REJECT="${{ github.event.inputs.reject_extensions }}"
+          CROSS_HOST="${{ github.event.inputs.cross_host }}"
+          WAIT_SEC="${{ github.event.inputs.wait_seconds }}"
+          SPLIT_THRESHOLD_MB="${{ github.event.inputs.split_threshold_mb }}"
+          SPLIT_THRESHOLD_BYTES=$(( SPLIT_THRESHOLD_MB * 1024 * 1024 ))
+
+          RUN_DIR="mirrors/run_$(date +%Y%m%d_%H%M%S)"
+          MIRROR_DIR="tmp_mirror"
+          mkdir -p "$RUN_DIR" "$MIRROR_DIR"
+
+          echo "🌍 Mirroring: $URL"
+          echo "   Depth: $DEPTH | Max size: ${MAX_SIZE_MB}MB | Wait: ${WAIT_SEC}s"
+          echo "   Reject: $REJECT | Cross‑host: $CROSS_HOST"
+          echo "   Run folder: $RUN_DIR"
+
+          # Build wget options
+          WGET_OPTS=(
+            --recursive
+            --level="$DEPTH"
+            --no-parent
+            --page-requisites
+            --convert-links
+            --adjust-extension
+            --no-clobber
+            --wait="$WAIT_SEC"
+            --random-wait
+            --limit-rate=200k
+            --directory-prefix="$MIRROR_DIR"
+            --no-verbose
+            --reject "$REJECT"
+          )
+
+          # Optional --max-size
+          if [ "$MAX_SIZE_MB" -gt 0 ]; then
+            MAX_SIZE_BYTES=$(( MAX_SIZE_MB * 1024 * 1024 ))
+            WGET_OPTS+=( --max-size="$MAX_SIZE_BYTES" )
+          fi
+
+          # Cross‑host?
+          if [ "$CROSS_HOST" = "true" ]; then
+            WGET_OPTS+=( --span-hosts )
+          fi
+
+          # Run the mirror
+          wget "${WGET_OPTS[@]}" "$URL" || echo "⚠️  wget finished with warnings (non‑fatal)"
+
+          # Package everything into a single zip archive (preserving structure)
+          ARCHIVE_NAME="mirror_$(date +%Y%m%d_%H%M%S).zip"
+          ZIPFILE="$RUN_DIR/$ARCHIVE_NAME"
+          echo "📦 Creating archive: $ZIPFILE"
+          (cd "$MIRROR_DIR" && zip -r -0 "../$ZIPFILE" .)   # -0 = store, no compression (fast)
+
+          # Split if the archive exceeds the threshold
+          split_if_large() {
+            local SRC="$1"
+            local DEST_DIR="$2"
+            local LIMIT="$3"
+            local SIZE
+            SIZE=$(stat -c%s "$SRC")
+            local BASE=$(basename "$SRC")
+            if [ "$LIMIT" -gt 0 ] && [ "$SIZE" -ge "$LIMIT" ]; then
+              echo "✂️  $BASE is $(( SIZE / 1024 / 1024 ))MB — splitting into ${SPLIT_THRESHOLD_MB}MB parts"
+              zip -0 -s "${SPLIT_THRESHOLD_MB}m" "$DEST_DIR/${BASE%.zip}.zip" -j "$SRC"
+              # Remove the original unsplit zip (if parts were created)
+              if ls "$DEST_DIR/${BASE%.zip}.z"* 1>/dev/null 2>&1; then
+                rm "$SRC"
+              fi
+              echo "   ✅ Parts created: $(ls $DEST_DIR/${BASE%.zip}.z* 2>/dev/null | wc -l)"
+            else
+              # Keep the single zip
+              echo "   📄 Archive kept as single file"
+            fi
+          }
+          split_if_large "$ZIPFILE" "$RUN_DIR" "$SPLIT_THRESHOLD_BYTES"
+
+          # Cleanup
+          rm -rf "$MIRROR_DIR"
+
+          # List all files in the run folder (for commit)
+          find "$RUN_DIR" -type f > created_files.txt
+          echo "📋 Files to commit: $(wc -l < created_files.txt)"
+
+          # Save run folder path for later steps
+          echo "$RUN_DIR" > run_dir.txt
+
+      - name: Generate download URLs list
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          REPO_OWNER="${GITHUB_REPOSITORY%/*}"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          BRANCH="${GITHUB_REF_NAME}"
+          RUN_DIR=$(cat run_dir.txt)
+
+          URL_FILE="${RUN_DIR}/download_urls.txt"
+          echo "📝 Generating raw download URLs for all chunks in ${RUN_DIR}..."
+          > "$URL_FILE"
+
+          find "$RUN_DIR" -type f ! -name "download_urls.txt" | sort | while read -r FILE; do
+            echo "https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${BRANCH}/${FILE}" >> "$URL_FILE"
+          done
+
+          echo "✅ URLs written to ${URL_FILE} ($(wc -l < "$URL_FILE") links)"
+          echo "$URL_FILE" >> created_files.txt
+
+      - name: Commit via GitHub API (parallel blobs, with retries)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          BLOB_CONCURRENCY: ${{ github.event.inputs.blob_concurrency }}
+        run: |
+          cat << 'SCRIPT' > api_commit.js
+          const fs = require('fs');
+          const { Octokit } = require('@octokit/rest');
+
+          const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+          const branch = process.env.GITHUB_REF_NAME;
+          const token = process.env.GITHUB_TOKEN;
+          const concurrency = parseInt(process.env.BLOB_CONCURRENCY || '10', 10);
+          const octokit = new Octokit({ auth: token });
+
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+          async function retryWithBackoff(fn, retries = 5, label = '') {
+            for (let attempt = 1; attempt <= retries; attempt++) {
+              try {
+                return await fn();
+              } catch (err) {
+                if (attempt === retries) throw err;
+                const delay = Math.min(1000 * 2 ** attempt + Math.random() * 1000, 15000);
+                console.warn(`   ⚠️ ${label} attempt ${attempt}/${retries} failed (${err.status || '?'}). Retrying in ${Math.round(delay/1000)}s...`);
+                await sleep(delay);
+              }
+            }
+          }
+
+          async function asyncPool(poolLimit, array, iteratorFn) {
+            const ret = [];
+            const executing = [];
+            for (const item of array) {
+              const p = Promise.resolve().then(() => iteratorFn(item, array));
+              ret.push(p);
+              if (poolLimit <= array.length) {
+                const e = p.then(() => executing.splice(executing.indexOf(e), 1));
+                executing.push(e);
+                if (executing.length >= poolLimit) {
+                  await Promise.race(executing);
+                }
+              }
+            }
+            return Promise.all(ret);
+          }
+
+          const fileListPath = process.argv[2] || 'created_files.txt';
+          if (!fs.existsSync(fileListPath)) {
+            console.log('No files to commit.');
+            process.exit(0);
+          }
+
+          let filePaths = fs.readFileSync(fileListPath, 'utf-8')
+            .split('\n')
+            .map(f => f.trim())
+            .filter(f => f.length > 0);
+
+          if (filePaths.length === 0) {
+            console.log('No files to commit.');
+            process.exit(0);
+          }
+
+          console.log(`📦 Total files to commit: ${filePaths.length}`);
+          console.log(`⚡ Blob concurrency: ${concurrency}`);
+
+          (async () => {
+            const { data: refData } = await octokit.git.getRef({
+              owner, repo, ref: `heads/${branch}`
+            });
+            const latestCommitSha = refData.object.sha;
+            console.log(`🔗 Latest commit: ${latestCommitSha}`);
+
+            const { data: commitData } = await octokit.git.getCommit({
+              owner, repo, commit_sha: latestCommitSha
+            });
+            let currentTreeSha = commitData.tree.sha;
+
+            const fileData = [];
+            let done = 0;
+            console.log(`\n⬆️  Creating ${filePaths.length} blobs (parallelism: ${concurrency})...`);
+
+            await asyncPool(concurrency, filePaths, async (filePath) => {
+              const content = await fs.promises.readFile(filePath, 'base64');
+              const blobSha = await retryWithBackoff(async () => {
+                const { data: blob } = await octokit.git.createBlob({
+                  owner, repo, content, encoding: 'base64'
+                });
+                return blob.sha;
+              }, 5, `Blob ${filePath}`);
+
+              fileData.push({ path: filePath, sha: blobSha });
+              done++;
+              if (done % 10 === 0 || done === filePaths.length) {
+                console.log(`   📄 Blob ${done}/${filePaths.length} (${((done/filePaths.length)*100).toFixed(0)}%)`);
+              }
+            });
+
+            console.log('✅ All blobs created successfully.');
+
+            const BATCH_SIZE = 100;
+            console.log(`\n🌳 Building trees (batch size ${BATCH_SIZE})...`);
+
+            for (let i = 0; i < fileData.length; i += BATCH_SIZE) {
+              const batch = fileData.slice(i, i + BATCH_SIZE);
+              const treeItems = batch.map(item => ({
+                path: item.path,
+                mode: '100644',
+                type: 'blob',
+                sha: item.sha
+              }));
+
+              currentTreeSha = await retryWithBackoff(async () => {
+                const { data: newTree } = await octokit.git.createTree({
+                  owner, repo, base_tree: currentTreeSha, tree: treeItems
+                });
+                return newTree.sha;
+              }, 5, 'Tree batch');
+
+              console.log(`   Tree SHA: ${currentTreeSha}`);
+            }
+
+            console.log(`\n📝 Creating commit...`);
+            const newCommitSha = await retryWithBackoff(async () => {
+              const { data: newCommit } = await octokit.git.createCommit({
+                owner, repo,
+                message: `[AVASAM] Mirror ${process.env.TARGET_URL || 'website'} -> ${process.env.RUN_DIR}`,
+                tree: currentTreeSha,
+                parents: [latestCommitSha]
+              });
+              return newCommit.sha;
+            }, 5, 'Create commit');
+
+            await retryWithBackoff(async () => {
+              await octokit.git.updateRef({
+                owner, repo, ref: `heads/${branch}`, sha: newCommitSha
+              });
+            }, 5, 'Update branch ref');
+
+            console.log(`\n✅ Successfully committed ${filePaths.length} files.`);
+          })().catch(err => {
+            console.error('❌ API commit failed:', err);
+            process.exit(1);
+          });
+          SCRIPT
+
+          # Pass environment variables to the script
+          export TARGET_URL="${{ github.event.inputs.url }}"
+          export RUN_DIR=$(cat run_dir.txt)
+          node api_commit.js created_files.txt
