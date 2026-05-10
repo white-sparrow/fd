@@ -10,7 +10,7 @@ on:
       split_threshold_mb:
         description: 'Split file if larger than this MB (0 = never split)'
         required: false
-        default: 50
+        default: 30
         type: number
       max_download_mb:
         description: 'Max total download size in MB (0 = no limit)'
@@ -25,7 +25,7 @@ on:
       blob_concurrency:
         description: 'Max parallel blob uploads during commit (1-20)'
         required: false
-        default: 5
+        default: 10
         type: number
 
 jobs:
