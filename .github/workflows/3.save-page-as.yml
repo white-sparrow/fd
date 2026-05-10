@@ -1,0 +1,485 @@
+name: 🌐 Save Page As… (Complete / MHTML)
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'Space-separated list of webpage URLs'
+        required: true
+        type: string
+      mode:
+        description: 'Save mode'
+        required: false
+        default: 'complete'
+        type: choice
+        options:
+          - complete
+          - mhtml
+      split_threshold_mb:
+        description: 'Split final zip larger than this MB (0 = never split)'
+        required: false
+        default: 30
+        type: number
+      blob_concurrency:
+        description: 'Max parallel blob uploads (1-20)'
+        required: false
+        default: 10
+        type: number
+
+jobs:
+  save-page:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Install system dependencies (Chromium requirements)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ca-certificates \
+            fonts-liberation \
+            libasound2t64 \
+            libatk-bridge2.0-0 \
+            libatk1.0-0 \
+            libc6 \
+            libcairo2 \
+            libcups2 \
+            libdbus-1-3 \
+            libexpat1 \
+            libfontconfig1 \
+            libgbm1 \
+            libglib2.0-0 \
+            libgtk-3-0 \
+            libnspr4 \
+            libnss3 \
+            libpango-1.0-0 \
+            libpangocairo-1.0-0 \
+            libx11-6 \
+            libx11-xcb1 \
+            libxcb1 \
+            libxcomposite1 \
+            libxcursor1 \
+            libxdamage1 \
+            libxext6 \
+            libxfixes3 \
+            libxi6 \
+            libxrandr2 \
+            libxrender1 \
+            libxss1 \
+            libxtst6 \
+            wget \
+            zip
+          npm install puppeteer-core @sparticuz/chromium
+
+      - name: Save pages using headless Chrome
+        run: |
+          cat << 'SCRIPT' > save_page.js
+          const fs = require('fs');
+          const path = require('path');
+          const { execSync } = require('child_process');
+          const puppeteer = require('puppeteer-core');
+          const chromium = require('@sparticuz/chromium');
+
+          const MODE = process.env.MODE;
+          const URLS = process.env.URLS.split(' ').filter(u => u.trim());
+          const RUN_DIR = `downloads/run_${new Date().toISOString().replace(/[:.]/g, '-')}`;
+          fs.mkdirSync(RUN_DIR, { recursive: true });
+
+          const SPLIT_MB = parseInt(process.env.SPLIT_THRESHOLD_MB || '0', 10);
+
+          console.log(`📦 Save mode: ${MODE}`);
+          console.log(`📁 Output directory: ${RUN_DIR}`);
+          if (SPLIT_MB > 0) console.log(`✂️ Will split zips > ${SPLIT_MB} MB`);
+
+          function run(cmd) {
+            console.log(`   🛠  ${cmd}`);
+            execSync(cmd, { stdio: 'inherit' });
+          }
+
+          // ---------- Complete mode: HTML + all assets, rewritten ----------
+          async function saveComplete(page, url, pageDir) {
+            // Collect all network responses
+            const responses = new Map();  // url -> buffer
+            const contentTypes = new Map(); // url -> content-type string
+
+            const handler = async (response) => {
+              const reqUrl = response.url();
+              if (responses.has(reqUrl)) return;
+              try {
+                const buffer = await response.buffer();
+                responses.set(reqUrl, buffer);
+                const ct = response.headers()['content-type'] || '';
+                contentTypes.set(reqUrl, ct);
+              } catch {}
+            };
+            page.on('response', handler);
+
+            await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 });
+            // Wait a little more for late requests
+            await new Promise(r => setTimeout(r, 3000));
+            page.off('response', handler);
+
+            // Get final DOM
+            let html = await page.content();
+            const baseUrl = page.url();
+
+            // Prepare mapping: original URL -> local relative path
+            const urlToPath = new Map();
+            const pathToUrl = new Map(); // reverse, needed for CSS later
+            let counter = 0;
+
+            // Save all resources except the main page itself
+            const resourceUrls = Array.from(responses.keys())
+              .filter(u => u !== baseUrl && responses.get(u));
+
+            // Sort by URL length descending – avoid shorter URL swallowing longer ones during replace
+            resourceUrls.sort((a, b) => b.length - a.length);
+
+            for (const resUrl of resourceUrls) {
+              const buf = responses.get(resUrl);
+              const ct = contentTypes.get(resUrl) || '';
+              // Determine extension
+              let ext = path.extname(new URL(resUrl).pathname) || '';
+              if (!ext) {
+                // guess from content-type
+                const mimeMap = {
+                  'text/css': '.css',
+                  'application/javascript': '.js',
+                  'image/png': '.png',
+                  'image/jpeg': '.jpg',
+                  'image/gif': '.gif',
+                  'image/svg+xml': '.svg',
+                  'font/woff': '.woff',
+                  'font/woff2': '.woff2',
+                  'application/font-woff': '.woff',
+                  'application/font-woff2': '.woff2'
+                };
+                const mimeMain = ct.split(';')[0];
+                ext = mimeMap[mimeMain] || '.dat';
+              }
+              const filename = `file_${counter++}${ext}`;
+              const localPath = `files/${filename}`;
+              urlToPath.set(resUrl, localPath);
+              pathToUrl.set(localPath, resUrl); // for CSS rewriting
+
+              const absFilePath = path.join(pageDir, localPath);
+              fs.mkdirSync(path.dirname(absFilePath), { recursive: true });
+              fs.writeFileSync(absFilePath, buf);
+            }
+
+            // Rewrite CSS files (also inline <style> blocks? easier: only external)
+            // We'll look for <link rel="stylesheet"> and rewrite their linked CSS files
+            // Actually, we need to rewrite every saved resource that is CSS
+            for (const [resUrl, localPath] of urlToPath.entries()) {
+              const ct = contentTypes.get(resUrl) || '';
+              if (ct.includes('css')) {
+                const absPath = path.join(pageDir, localPath);
+                let css = fs.readFileSync(absPath, 'utf8');
+                // Replace url("...") or url(...) with captured local paths
+                css = css.replace(/url\((\s*["']?)([^"')]+?)(\1\s*)\)/g, (match, q, urlInside) => {
+                  // Resolve relative URLs in CSS against the CSS file's original location
+                  try {
+                    const absolute = new URL(urlInside, resUrl).href;
+                    if (urlToPath.has(absolute)) {
+                      return `url(${q}${urlToPath.get(absolute)}${q})`;
+                    }
+                  } catch {}
+                  return match; // keep original if not captured
+                });
+                fs.writeFileSync(absPath, css);
+              }
+            }
+
+            // Rewrite HTML: replace every resource URL with its local path (longest first already sorted)
+            // Also handle inline style attrs and <style> blocks? They might also contain url().
+            // We can apply the same CSS rewriting logic to inline styles and <style> blocks using the mapping.
+            // First, process <style> blocks
+            html = html.replace(/(<style[^>]*>)([\s\S]*?)(<\/style>)/gi, (match, open, css, close) => {
+              const rewrittenCss = css.replace(/url\((\s*["']?)([^"')]+?)(\1\s*)\)/g, (m, q, urlInside) => {
+                try {
+                  // Resolve against the page's base URL (since inline styles are relative to the document)
+                  const absolute = new URL(urlInside, baseUrl).href;
+                  if (urlToPath.has(absolute)) {
+                    return `url(${q}${urlToPath.get(absolute)}${q})`;
+                  }
+                } catch {}
+                return m;
+              });
+              return open + rewrittenCss + close;
+            });
+
+            // Replace style attributes (style="...")
+            html = html.replace(/style\s*=\s*["']([^"']*)["']/gi, (match, styleContent) => {
+              const rewritten = styleContent.replace(/url\((\s*["']?)([^"')]+?)(\1\s*)\)/g, (m, q, urlInside) => {
+                try {
+                  const absolute = new URL(urlInside, baseUrl).href;
+                  if (urlToPath.has(absolute)) {
+                    return `url(${q}${urlToPath.get(absolute)}${q})`;
+                  }
+                } catch {}
+                return m;
+              });
+              return `style="${rewritten}"`;
+            });
+
+            // Now replace URLs in the whole HTML (attributes like src, href, srcset, etc.)
+            for (const [resUrl, localPath] of urlToPath.entries()) {
+              // Escape for literal regex
+              const escaped = resUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              // global replace – safe because we sorted by length descending
+              html = html.replace(new RegExp(escaped, 'g'), localPath);
+            }
+
+            // Save index.html
+            fs.writeFileSync(path.join(pageDir, 'index.html'), html);
+            console.log(`✅ Complete page saved to ${pageDir}`);
+          }
+
+          // ---------- MHTML mode ----------
+          async function saveMHTML(page, url, outputPath) {
+            await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 });
+            const cdp = await page.target().createCDPSession();
+            const { data } = await cdp.send('Page.captureSnapshot', { format: 'mhtml' });
+            fs.writeFileSync(outputPath, data);
+            console.log(`✅ MHTML saved to ${outputPath}`);
+          }
+
+          // ---------- Zip & split helper ----------
+          async function zipAndSplit(sourcePath, archiveBaseName) {
+            if (!fs.existsSync(sourcePath)) throw new Error(`Source not found: ${sourcePath}`);
+            const archivePath = path.resolve(RUN_DIR, `${archiveBaseName}.zip`);
+            const sourceDir = path.dirname(sourcePath);
+            const sourceName = path.basename(sourcePath);
+
+            if (fs.lstatSync(sourcePath).isDirectory()) {
+              run(`cd "${sourceDir}" && zip -r "${archivePath}" "${sourceName}"`);
+            } else {
+              run(`cd "${sourceDir}" && zip "${archivePath}" "${sourceName}"`);
+            }
+            console.log(`📦 Created ${archivePath}`);
+
+            run(`rm -rf "${sourcePath}"`);
+
+            if (SPLIT_MB > 0) {
+              const size = fs.statSync(archivePath).size;
+              if (size >= SPLIT_MB * 1024 * 1024) {
+                console.log(`✂️ Splitting ${path.basename(archivePath)} (${(size/1024/1024).toFixed(0)} MB)`);
+                const prefix = archivePath;
+                run(`cd "${path.dirname(archivePath)}" && zip -0 -s ${SPLIT_MB}m "${prefix}" -j "${path.basename(archivePath)}"`);
+                if (fs.existsSync(`${archivePath}.z01`)) {
+                  fs.unlinkSync(archivePath);
+                }
+              }
+            }
+          }
+
+          // ---------- Main ----------
+          (async () => {
+            const browser = await puppeteer.launch({
+              args: chromium.args,
+              defaultViewport: chromium.defaultViewport,
+              executablePath: await chromium.executablePath(),
+              headless: true,
+            });
+
+            for (const url of URLS) {
+              const pageName = url.replace(/https?:\/\//, '').replace(/[^a-zA-Z0-9]/g, '_').substring(0, 80);
+              console.log(`\n🌍 ${url}`);
+
+              const page = await browser.newPage();
+              await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+              if (MODE === 'complete') {
+                const pageDir = path.resolve(RUN_DIR, pageName);
+                fs.mkdirSync(pageDir, { recursive: true });
+                await saveComplete(page, url, pageDir);
+                await page.close();
+                await zipAndSplit(pageDir, pageName);
+              } else {
+                const tempFile = path.resolve(RUN_DIR, `${pageName}.mhtml`);
+                await saveMHTML(page, url, tempFile);
+                await page.close();
+                await zipAndSplit(tempFile, pageName);
+              }
+            }
+            await browser.close();
+
+            execSync(`find ${RUN_DIR} -type f > created_files.txt`);
+            console.log(`📋 File list written.`);
+          })().catch(err => {
+            console.error(err);
+            process.exit(1);
+          });
+          SCRIPT
+
+          node save_page.js
+        env:
+          MODE: ${{ github.event.inputs.mode }}
+          URLS: ${{ github.event.inputs.urls }}
+          SPLIT_THRESHOLD_MB: ${{ github.event.inputs.split_threshold_mb }}
+
+      - name: Commit new files via GitHub API (parallel blobs, with retries)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          BLOB_CONCURRENCY: ${{ github.event.inputs.blob_concurrency }}
+        run: |
+          npm install @octokit/rest
+
+          cat << 'EOF' > api_commit.js
+          const fs = require('fs');
+          const { Octokit } = require('@octokit/rest');
+
+          const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+          const branch = process.env.GITHUB_REF_NAME;
+          const token = process.env.GITHUB_TOKEN;
+          const concurrency = parseInt(process.env.BLOB_CONCURRENCY || '10', 10);
+          const octokit = new Octokit({ auth: token });
+
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+          async function retryWithBackoff(fn, retries = 5, label = '') {
+            for (let attempt = 1; attempt <= retries; attempt++) {
+              try {
+                return await fn();
+              } catch (err) {
+                if (attempt === retries) throw err;
+                const delay = Math.min(1000 * 2 ** attempt + Math.random() * 1000, 15000);
+                console.warn(`   ⚠️ ${label} attempt ${attempt}/${retries} failed (${err.status || '?'}). Retrying in ${Math.round(delay/1000)}s...`);
+                await sleep(delay);
+              }
+            }
+          }
+
+          async function asyncPool(poolLimit, array, iteratorFn) {
+            const ret = [];
+            const executing = [];
+            for (const item of array) {
+              const p = Promise.resolve().then(() => iteratorFn(item, array));
+              ret.push(p);
+              if (poolLimit <= array.length) {
+                const e = p.then(() => executing.splice(executing.indexOf(e), 1));
+                executing.push(e);
+                if (executing.length >= poolLimit) {
+                  await Promise.race(executing);
+                }
+              }
+            }
+            return Promise.all(ret);
+          }
+
+          const fileListPath = process.argv[2] || 'created_files.txt';
+          if (!fs.existsSync(fileListPath)) {
+            console.log('No files to commit.');
+            process.exit(0);
+          }
+
+          let filePaths = fs.readFileSync(fileListPath, 'utf-8')
+            .split('\n')
+            .map(f => f.trim())
+            .filter(f => f.length > 0);
+
+          if (filePaths.length === 0) {
+            console.log('No files to commit.');
+            process.exit(0);
+          }
+
+          console.log(`📦 Total files to commit: ${filePaths.length}`);
+          console.log(`⚡ Blob concurrency: ${concurrency}`);
+
+          (async () => {
+            const { data: refData } = await octokit.git.getRef({
+              owner, repo, ref: `heads/${branch}`
+            });
+            const latestCommitSha = refData.object.sha;
+            console.log(`🔗 Latest commit: ${latestCommitSha}`);
+
+            const { data: commitData } = await octokit.git.getCommit({
+              owner, repo, commit_sha: latestCommitSha
+            });
+            let currentTreeSha = commitData.tree.sha;
+
+            const fileData = [];
+            let done = 0;
+            console.log(`\n⬆️  Creating ${filePaths.length} blobs (parallelism: ${concurrency})...`);
+
+            await asyncPool(concurrency, filePaths, async (filePath) => {
+              const content = await fs.promises.readFile(filePath, 'base64');
+              const blobSha = await retryWithBackoff(async () => {
+                const { data: blob } = await octokit.git.createBlob({
+                  owner, repo,
+                  content,
+                  encoding: 'base64'
+                });
+                return blob.sha;
+              }, 5, `Blob ${filePath}`);
+
+              fileData.push({ path: filePath, sha: blobSha });
+              done++;
+              if (done % 10 === 0 || done === filePaths.length) {
+                const pct = ((done / filePaths.length) * 100).toFixed(0);
+                console.log(`   📄 Blob ${done}/${filePaths.length} (${pct}%)`);
+              }
+            });
+
+            console.log('✅ All blobs created successfully.');
+
+            const BATCH_SIZE = 100;
+            const totalBatches = Math.ceil(fileData.length / BATCH_SIZE);
+            console.log(`\n🌳 Building trees (batch size ${BATCH_SIZE}, ${totalBatches} batches)...`);
+
+            for (let i = 0; i < fileData.length; i += BATCH_SIZE) {
+              const batch = fileData.slice(i, i + BATCH_SIZE);
+              const batchIndex = Math.floor(i / BATCH_SIZE) + 1;
+              console.log(`   🔨 Batch ${batchIndex}/${totalBatches} – ${batch.length} files`);
+
+              const treeItems = batch.map(item => ({
+                path: item.path,
+                mode: '100644',
+                type: 'blob',
+                sha: item.sha
+              }));
+
+              const newTreeSha = await retryWithBackoff(async () => {
+                const { data: newTree } = await octokit.git.createTree({
+                  owner, repo,
+                  base_tree: currentTreeSha,
+                  tree: treeItems
+                });
+                return newTree.sha;
+              }, 5, `Tree batch ${batchIndex}`);
+
+              currentTreeSha = newTreeSha;
+              console.log(`      New tree SHA: ${currentTreeSha}`);
+            }
+
+            console.log(`\n📝 Creating commit with tree ${currentTreeSha}...`);
+            const newCommitSha = await retryWithBackoff(async () => {
+              const { data: newCommit } = await octokit.git.createCommit({
+                owner, repo,
+                message: `[Save Page] Webpage archive -> downloads/run_...`,
+                tree: currentTreeSha,
+                parents: [latestCommitSha]
+              });
+              return newCommit.sha;
+            }, 5, 'Create commit');
+
+            console.log(`   Commit SHA: ${newCommitSha}`);
+
+            await retryWithBackoff(async () => {
+              await octokit.git.updateRef({
+                owner, repo,
+                ref: `heads/${branch}`,
+                sha: newCommitSha
+              });
+            }, 5, 'Update branch ref');
+
+            console.log(`\n✅ Successfully committed ${filePaths.length} files.`);
+          })().catch(err => {
+            console.error('❌ API commit failed:', err);
+            process.exit(1);
+          });
+          EOF
+
+          node api_commit.js created_files.txt
