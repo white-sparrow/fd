@@ -1,0 +1,396 @@
+name: 📴 2-MHTML Deep Save (API–no checkout)
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL of the webpage'
+        required: true
+        default: 'https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF'
+      split_threshold_mb:
+        description: 'Split file if larger than this MB (0 = never split)'
+        required: false
+        default: 50
+        type: number
+      max_download_mb:
+        description: 'Max total download size in MB (0 = no limit)'
+        required: false
+        default: 100
+        type: number
+      max_depth:
+        description: 'Subpage crawl depth (0 = main page only, 1 = + direct subpages, …)'
+        required: false
+        default: 1
+        type: number
+      blob_concurrency:
+        description: 'Max parallel blob uploads during commit (1-20)'
+        required: false
+        default: 5
+        type: number
+
+jobs:
+  mhtml:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies (Puppeteer + Octokit + zip)
+        run: |
+          sudo apt-get update && sudo apt-get install -y zip
+          npm install puppeteer @octokit/rest
+
+      - name: Crawl pages, split, generate URL list & commit
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          BLOB_CONCURRENCY: ${{ github.event.inputs.blob_concurrency }}
+        run: |
+          URL="${{ github.event.inputs.url }}"
+          THRESHOLD_MB="${{ github.event.inputs.split_threshold_mb }}"
+          MAX_MB="${{ github.event.inputs.max_download_mb }}"
+          MAX_DEPTH="${{ github.event.inputs.max_depth }}"
+
+          URL_CLEAN=$(echo "$URL" | sed -e 's#^https\?://##' -e 's#/$##' -e 's#/#-#g')
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          RUN_FOLDER="downloads/${URL_CLEAN}_${TIMESTAMP}"
+          mkdir -p "$RUN_FOLDER"
+
+          echo "📁 Run folder: $RUN_FOLDER"
+
+          cat <<'SCRIPT' > crawler_and_commit.js
+          const puppeteer = require('puppeteer');
+          const path = require('path');
+          const fs = require('fs');
+          const { execSync } = require('child_process');
+          const { Octokit } = require('@octokit/rest');
+
+          const baseURL = process.argv[2];
+          const thresholdMB = parseInt(process.argv[3]);
+          const maxMB = parseInt(process.argv[4]);
+          const maxDepth = parseInt(process.argv[5]);
+          if (isNaN(maxDepth)) {
+            console.warn('⚠️ Invalid max_depth, defaulting to 0');
+            maxDepth = 0;
+          }
+          const runFolder = process.argv[6];
+          const blobConcurrency = parseInt(process.env.BLOB_CONCURRENCY || '5', 10);
+
+          const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+          const branch = process.env.GITHUB_REF_NAME;
+          const token = process.env.GITHUB_TOKEN;
+          const octokit = new Octokit({ auth: token });
+
+          // ─── utilities ────────────────────────────────────
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+          async function retryWithBackoff(fn, retries = 5, label = '') {
+            for (let attempt = 1; attempt <= retries; attempt++) {
+              try {
+                return await fn();
+              } catch (err) {
+                if (attempt === retries) throw err;
+                const delay = Math.min(1000 * 2 ** attempt + Math.random() * 1000, 15000);
+                console.warn(`   ⚠️ ${label} attempt ${attempt}/${retries} failed (${err.status || '?'}). Retrying in ${Math.round(delay/1000)}s...`);
+                await sleep(delay);
+              }
+            }
+          }
+
+          async function asyncPool(poolLimit, array, iteratorFn) {
+            const ret = [];
+            const executing = [];
+            for (const item of array) {
+              const p = Promise.resolve().then(() => iteratorFn(item, array));
+              ret.push(p);
+              if (poolLimit <= array.length) {
+                const e = p.then(() => executing.splice(executing.indexOf(e), 1));
+                executing.push(e);
+                if (executing.length >= poolLimit) {
+                  await Promise.race(executing);
+                }
+              }
+            }
+            return Promise.all(ret);
+          }
+
+          // ─── filename helper (URL → safe .mhtml name) ─────
+          function pathToFilename(urlStr) {
+            const u = new URL(urlStr);
+            let p = u.pathname.replace(/\/$/, '').replace(/^\//, '').replace(/\//g, '-');
+            if (!p) p = 'index';
+            return p + '.mhtml';
+          }
+
+          // ─── zip-based splitting (replaces split -b) ───────
+          function splitIfLarge(filePath, thresholdBytes) {
+            const stat = fs.statSync(filePath);
+            if (thresholdBytes <= 0 || stat.size <= thresholdBytes) return [filePath];
+
+            const dir = path.dirname(filePath);
+            const base = path.basename(filePath);
+            const zipBase = path.join(dir, base + '.zip');
+
+            console.log(`✂️  Splitting ${base} (${(stat.size/1024/1024).toFixed(1)}MB) into ${thresholdMB}MB parts...`);
+            // zip -0 -s <size>m <dest>.zip -j <source>
+            execSync(`zip -0 -s ${thresholdMB}m "${zipBase}" -j "${filePath}"`, { stdio: 'inherit' });
+            fs.unlinkSync(filePath);  // remove original
+
+            // gather all parts: zip, z01, z02, ...
+            const parts = fs.readdirSync(dir)
+              .filter(f => f.startsWith(base + '.zip') && !f.endsWith('.zi'))  // .zip, .z01, .z02 ... (rough)
+              .map(f => path.join(dir, f))
+              .sort();
+            return parts;
+          }
+
+          // ─── generate raw download URLs list ──────────────
+          function generateUrlList(filePaths) {
+            const urlFile = path.join(runFolder, 'download_urls.txt');
+            console.log(`📝 Generating ${urlFile}...`);
+            const lines = filePaths.map(fp => {
+              // file path is relative to repo root, e.g., downloads/runFolder/file
+              const relPath = fp;   // already full relative path
+              return `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${relPath}`;
+            });
+            fs.writeFileSync(urlFile, lines.join('\n'), 'utf-8');
+            filePaths.push(urlFile);  // include in commit
+            console.log(`✅ URL list created (${lines.length} links)`);
+            return filePaths;
+          }
+
+          // ─── committing (batched trees, parallel blobs) ────
+          async function commitFiles(filePaths) {
+            if (filePaths.length === 0) {
+              console.log('📭 No files to commit.');
+              return;
+            }
+            console.log(`\n⬆️  Committing ${filePaths.length} files (blob concurrency=${blobConcurrency})...`);
+
+            // 1. Get latest commit & base tree
+            const { data: refData } = await octokit.git.getRef({
+              owner, repo, ref: `heads/${branch}`
+            });
+            const latestCommitSha = refData.object.sha;
+            console.log(`🔗 Latest commit: ${latestCommitSha}`);
+
+            const { data: commitData } = await octokit.git.getCommit({
+              owner, repo, commit_sha: latestCommitSha
+            });
+            let currentTreeSha = commitData.tree.sha;
+
+            // 2. Create blobs in parallel with retries
+            const fileData = [];
+            let done = 0;
+            await asyncPool(blobConcurrency, filePaths, async (filePath) => {
+              const content = await fs.promises.readFile(filePath, 'base64');
+              const blobSha = await retryWithBackoff(async () => {
+                const { data: blob } = await octokit.git.createBlob({
+                  owner, repo,
+                  content,
+                  encoding: 'base64'
+                });
+                return blob.sha;
+              }, 5, `Blob ${filePath}`);
+
+              fileData.push({ path: filePath, sha: blobSha });
+              done++;
+              if (done % 10 === 0 || done === filePaths.length) {
+                const pct = ((done / filePaths.length) * 100).toFixed(0);
+                console.log(`   📄 Blob ${done}/${filePaths.length} (${pct}%)`);
+              }
+            });
+
+            // 3. Build trees in batches of 100
+            const BATCH_SIZE = 100;
+            const totalBatches = Math.ceil(fileData.length / BATCH_SIZE);
+            console.log(`🌳 Building trees (batch size ${BATCH_SIZE}, ${totalBatches} batches)...`);
+
+            for (let i = 0; i < fileData.length; i += BATCH_SIZE) {
+              const batch = fileData.slice(i, i + BATCH_SIZE);
+              const batchIndex = Math.floor(i / BATCH_SIZE) + 1;
+              console.log(`   🔨 Batch ${batchIndex}/${totalBatches} – ${batch.length} files`);
+
+              const treeItems = batch.map(item => ({
+                path: item.path,
+                mode: '100644',
+                type: 'blob',
+                sha: item.sha
+              }));
+
+              const newTreeSha = await retryWithBackoff(async () => {
+                const { data: newTree } = await octokit.git.createTree({
+                  owner, repo,
+                  base_tree: currentTreeSha,
+                  tree: treeItems
+                });
+                return newTree.sha;
+              }, 5, `Tree batch ${batchIndex}`);
+
+              currentTreeSha = newTreeSha;
+              console.log(`      New tree SHA: ${currentTreeSha}`);
+            }
+
+            // 4. Create commit & update ref
+            console.log(`\n📝 Creating commit with tree ${currentTreeSha}...`);
+            const newCommitSha = await retryWithBackoff(async () => {
+              const { data: newCommit } = await octokit.git.createCommit({
+                owner, repo,
+                message: `[AVASAM] MHTML crawl of ${baseURL}`,
+                tree: currentTreeSha,
+                parents: [latestCommitSha]
+              });
+              return newCommit.sha;
+            }, 5, 'Create commit');
+
+            console.log(`   Commit SHA: ${newCommitSha}`);
+
+            await retryWithBackoff(async () => {
+              await octokit.git.updateRef({
+                owner, repo,
+                ref: `heads/${branch}`,
+                sha: newCommitSha
+              });
+            }, 5, 'Update branch ref');
+
+            console.log(`✅ Committed ${filePaths.length} files. New commit: ${newCommitSha}`);
+          }
+
+          // ─── crawling logic (unchanged) ────────────────────
+          const baseUrlObj = new URL(baseURL);
+          const basePath = baseUrlObj.pathname.replace(/\/$/, '');
+          const visited = new Set();
+          let totalBytes = 0;
+          const createdFiles = [];   // paths to final files (after any splitting)
+
+          async function capturePage(page, pageUrl, depth) {
+            if (visited.has(pageUrl)) return true;
+            visited.add(pageUrl);
+
+            console.log(`📄 [Depth ${depth}/${maxDepth}] Capturing: ${pageUrl}`);
+
+            try {
+              await page.goto(pageUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+            } catch (navErr) {
+              console.log(`⚠️  Skipping ${pageUrl}: navigation failed (${navErr.message})`);
+              return true;
+            }
+
+            let data;
+            try {
+              const cdp = await page.createCDPSession();
+              const result = await cdp.send('Page.captureSnapshot', { format: 'mhtml' });
+              data = result.data;
+              await cdp.detach();
+            } catch (snapErr) {
+              console.log(`⚠️  Could not snapshot ${pageUrl}: ${snapErr.message}`);
+              return true;
+            }
+
+            const fname = pathToFilename(pageUrl);
+            let filePath = path.join(runFolder, fname);
+            fs.writeFileSync(filePath, data);
+
+            const stat = fs.statSync(filePath);
+            totalBytes += stat.size;
+
+            // Split if needed (uses zip)
+            const finalPaths = splitIfLarge(filePath, thresholdMB * 1024 * 1024);
+            finalPaths.forEach(fp => createdFiles.push(fp));
+
+            if (maxMB > 0 && totalBytes > maxMB * 1024 * 1024) {
+              console.log(`⚠️  Total downloaded exceeded ${maxMB}MB. Stopping crawl.`);
+              return false;
+            }
+            return true;
+          }
+
+          async function crawl(browser, url, currentDepth) {
+            console.log(`🔍 [Depth ${currentDepth}/${maxDepth}] Crawling: ${url}`);
+            if (currentDepth > maxDepth) {
+              console.log(`⛔ Skipping – depth ${currentDepth} exceeds limit ${maxDepth}`);
+              return;
+            }
+
+            const page = await browser.newPage();
+            try {
+              const ok = await capturePage(page, url, currentDepth);
+              if (!ok) return;
+
+              if (currentDepth < maxDepth) {
+                const links = await page.$$eval('a[href]', anchors =>
+                  anchors.map(a => a.href).filter(h => h.startsWith('http'))
+                );
+
+                const skipExtensions = new Set([
+                  'zip','tar','gz','bz2','xz','7z','rar','exe','dmg','iso','deb','rpm',
+                  'bin','safetensors','pt','pth','ckpt','h5','hdf5','onnx','pb','tflite',
+                  'keras','joblib','pkl','pickle','gguf','ggml','mar','model','weights',
+                  'npy','npz','csv','tsv','parquet','feather','arrow',
+                  'pdf','doc','docx','ppt','pptx','xls','xlsx',
+                  'mp3','mp4','avi','mov','mkv','webm','ogg','wav','flac',
+                ]);
+
+                const host = baseUrlObj.host;
+                const subLinks = links.filter(l => {
+                  let u;
+                  try { u = new URL(l); } catch (e) { return false; }
+                  if (u.host !== host) return false;
+
+                  const rawPath = u.pathname.replace(/\/$/, '');
+                  if (!rawPath.startsWith(basePath)) return false;
+                  if (rawPath === basePath || rawPath.length <= basePath.length) return false;
+
+                  const lastPart = rawPath.split('/').pop() || '';
+                  const ext = lastPart.includes('.') ? lastPart.split('.').pop().toLowerCase() : '';
+
+                  if (ext && skipExtensions.has(ext)) {
+                    console.log(`⏩  Skipping (file extension): ${u.href}`);
+                    return false;
+                  }
+                  return true;
+                });
+
+                const uniqueLinks = [...new Set(subLinks)];
+
+                for (const link of uniqueLinks) {
+                  if (maxMB > 0 && totalBytes > maxMB * 1024 * 1024) break;
+                  await crawl(browser, link, currentDepth + 1);
+                }
+              }
+            } finally {
+              try { await page.close(); } catch (_) {}
+            }
+          }
+
+          // ─── main ──────────────────────────────────────────
+          (async () => {
+            const browser = await puppeteer.launch({
+              headless: 'new',
+              args: ['--no-sandbox', '--disable-setuid-sandbox']
+            });
+
+            console.log(`🌐 Starting crawl from: ${baseURL}`);
+            console.log(`   Subpath only: ${basePath}`);
+            console.log(`   Max depth: ${maxDepth}`);
+            console.log(`   Max total size: ${maxMB} MB`);
+
+            await crawl(browser, baseURL, 0);
+            await browser.close();
+
+            console.log(`📁 Crawl finished. Files captured: ${createdFiles.length}`);
+
+            // Add download_urls.txt to the file list
+            const finalFiles = generateUrlList(createdFiles);
+
+            // Commit everything
+            await commitFiles(finalFiles);
+          })();
+          SCRIPT
+
+          node crawler_and_commit.js "$URL" "$THRESHOLD_MB" "$MAX_MB" "$MAX_DEPTH" "$RUN_FOLDER"
