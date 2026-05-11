@@ -1,5 +1,0 @@
-https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/huggingface.co-unsloth-gemma-4-E2B-it-GGUF_20260510_170123/unsloth-gemma-4-E2B-it-GGUF.mhtml
-https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/huggingface.co-unsloth-gemma-4-E2B-it-GGUF_20260510_170123/unsloth-gemma-4-E2B-it-GGUF-tree-main.mhtml
-https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/huggingface.co-unsloth-gemma-4-E2B-it-GGUF_20260510_170123/unsloth-gemma-4-E2B-it-GGUF-discussions.mhtml
-https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/huggingface.co-unsloth-gemma-4-E2B-it-GGUF_20260510_170123/unsloth-gemma-4-E2B-it-GGUF-colab.mhtml
-https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/huggingface.co-unsloth-gemma-4-E2B-it-GGUF_20260510_170123/unsloth-gemma-4-E2B-it-GGUF-kaggle.mhtml
