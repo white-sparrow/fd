@@ -1,0 +1,1 @@
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/huggingface.co-unsloth-Qwen3-Coder-Next-GGUF-tree-main-UD-Q5_K_S_20260512_125012/unsloth-Qwen3-Coder-Next-GGUF-tree-main-UD-Q5_K_S.mhtml
