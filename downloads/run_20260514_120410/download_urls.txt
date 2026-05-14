@@ -1,0 +1,2 @@
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/run_20260514_120410/deno-aarch64-pc-windows-msvc.zip.z01
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/run_20260514_120410/deno-aarch64-pc-windows-msvc.zip.zip
