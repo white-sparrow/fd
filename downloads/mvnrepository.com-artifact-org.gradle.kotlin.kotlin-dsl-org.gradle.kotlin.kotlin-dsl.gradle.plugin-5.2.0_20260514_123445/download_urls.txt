@@ -1,0 +1,1 @@
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/mvnrepository.com-artifact-org.gradle.kotlin.kotlin-dsl-org.gradle.kotlin.kotlin-dsl.gradle.plugin-5.2.0_20260514_123445/artifact-org.gradle.kotlin.kotlin-dsl-org.gradle.kotlin.kotlin-dsl.gradle.plugin-5.2.0.mhtml
