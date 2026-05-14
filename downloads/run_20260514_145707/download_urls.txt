@@ -1,0 +1,5 @@
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/run_20260514_145707/llama-b9145-bin-win-cuda-13.1-x64.zip.z01
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/run_20260514_145707/llama-b9145-bin-win-cuda-13.1-x64.zip.z02
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/run_20260514_145707/llama-b9145-bin-win-cuda-13.1-x64.zip.z03
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/run_20260514_145707/llama-b9145-bin-win-cuda-13.1-x64.zip.z04
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/run_20260514_145707/llama-b9145-bin-win-cuda-13.1-x64.zip.zip
