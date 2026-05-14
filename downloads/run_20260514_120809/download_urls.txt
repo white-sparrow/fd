@@ -1,0 +1,2 @@
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/run_20260514_120809/deno-x86_64-pc-windows-msvc.zip.z01
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/run_20260514_120809/deno-x86_64-pc-windows-msvc.zip.zip
