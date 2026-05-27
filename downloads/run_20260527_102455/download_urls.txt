@@ -1,0 +1,2 @@
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/run_20260527_102455/go1.26.3.windows-amd64.msi.z01
+https://raw.githubusercontent.com/white-sparrow/fd/main/downloads/run_20260527_102455/go1.26.3.windows-amd64.msi.zip
